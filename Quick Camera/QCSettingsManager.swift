@@ -4,7 +4,7 @@ import os
 @MainActor
 final class QCSettingsManager {
     // MARK: - Logging
-    private let logger = Logger(subsystem: "com.jasonkristian.QCamera", category: "QCSettingsManager")
+    private let logger = Logger(subsystem: "com.simonguest.QCamera", category: "QCSettingsManager")
 
     // MARK: - User Defaults Keys
     private enum Key {

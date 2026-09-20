@@ -11,7 +11,7 @@ struct QCSettingsManagerTests {
     /// Each test gets its own throwaway defaults suite, so the app's real preferences
     /// (including the chosen snapshots folder) are never touched.
     private func withTemporaryDefaults(_ body: (UserDefaults, String) throws -> Void) rethrows {
-        let suiteName = "com.jasonkristian.QCamera.tests.\(UUID().uuidString)"
+        let suiteName = "com.simonguest.QCamera.tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         try body(defaults, suiteName)

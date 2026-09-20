@@ -28,7 +28,7 @@ final class QCVoiceListener {
     private var lastTriggerDate: Date?
 
     private let logger = Logger(
-        subsystem: "com.jasonkristian.QCamera", category: "QCVoiceListener")
+        subsystem: "com.simonguest.QCamera", category: "QCVoiceListener")
 
     /// Starts listening. Returns false after reporting the reason via the delegate if
     /// the microphone, permissions, or transcription assets are unavailable.

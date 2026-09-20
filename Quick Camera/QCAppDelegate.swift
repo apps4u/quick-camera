@@ -93,8 +93,8 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
     // MARK: - Capture Queues
     /* startRunning/stopRunning block, so session work stays off the main thread. AVCaptureSession
        has no async API and requires a serial queue, so GCD remains the right tool here. */
-    private let sessionQueue = DispatchQueue(label: "com.jasonkristian.QCamera.session")
-    private let videoDataQueue = DispatchQueue(label: "com.jasonkristian.QCamera.videoData")
+    private let sessionQueue = DispatchQueue(label: "com.simonguest.QCamera.session")
+    private let videoDataQueue = DispatchQueue(label: "com.simonguest.QCamera.videoData")
 
     /// Written by captureOutput and read via videoDataQueue.sync, so videoDataQueue -
     /// not the main actor - serialises access to it.
@@ -104,7 +104,7 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
     private let ciContext = CIContext()
 
     // MARK: - Logging
-    private let logger = Logger(subsystem: "com.jasonkristian.QCamera", category: "QCAppDelegate")
+    private let logger = Logger(subsystem: "com.simonguest.QCamera", category: "QCAppDelegate")
 
     // MARK: - Error Handling
     func errorMessage(message: String) {
