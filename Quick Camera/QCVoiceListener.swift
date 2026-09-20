@@ -82,7 +82,7 @@ final class QCVoiceListener {
                     failedWith:
                         "Unfortunately, no microphone could be found to listen for the \"\(QCVoiceCommand.triggerWord)\" command."
                 )
-                try await analyzer.cancelAndFinishNow()
+                await analyzer.cancelAndFinishNow()
                 return false
             }
 
@@ -127,7 +127,7 @@ final class QCVoiceListener {
         inputBuilder?.finish()
         inputBuilder = nil
         if let analyzer {
-            Task { try? await analyzer.cancelAndFinishNow() }
+            Task { await analyzer.cancelAndFinishNow() }
         }
         analyzer = nil
         isListening = false
