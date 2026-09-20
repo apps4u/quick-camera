@@ -1,79 +1,92 @@
-import AVFoundation
 import Cocoa
+import os
 
-class QCSettingsManager {
+@MainActor
+final class QCSettingsManager {
+    // MARK: - Logging
+    private let logger = Logger(subsystem: "com.jasonkristian.QCamera", category: "QCSettingsManager")
+
+    // MARK: - User Defaults Keys
+    private enum Key {
+        static let deviceName = "deviceName"
+        static let borderless = "borderless"
+        static let mirrored = "mirrored"
+        static let upsideDown = "upsideDown"
+        static let aspectRatioFixed = "aspectRatioFixed"
+        static let position = "position"
+        static let snapshotFolderBookmark = "snapshotFolderBookmark"
+        static let voiceCommandEnabled = "voiceCommandEnabled"
+        static let frameX = "frameX"
+        static let frameY = "frameY"
+        static let frameWidth = "frameW"
+        static let frameHeight = "frameH"
+    }
+
     // MARK: - Properties
-    private(set) var isMirrored: Bool = false
-    private(set) var isUpsideDown: Bool = false
-    private(set) var isBorderless: Bool = false
-    private(set) var isAspectRatioFixed: Bool = false
-    private(set) var position: Int = 0
-    private(set) var deviceName: String = "-"
-    private(set) var savedDeviceName: String = "-"
+    var isMirrored = false
+    var isUpsideDown = false
+    var isBorderless = false
+    var isAspectRatioFixed = false
+    var position = 0
+    var deviceName = "-"
+    private(set) var savedDeviceName = "-"
 
-    // MARK: - Frame Properties
-    private(set) var frameX: Float = 100
-    private(set) var frameY: Float = 100
-    private(set) var frameWidth: Float = 0
-    private(set) var frameHeight: Float = 0
+    /// Window frame to restore at launch; nil when nothing usable has been saved.
+    var windowFrame: NSRect?
+
+    /// Security-scoped bookmark for the folder snapshots are written to. Backed directly by
+    /// UserDefaults so the choice persists immediately, without an explicit "Save Settings".
+    var snapshotFolderBookmark: Data? {
+        get { defaults.data(forKey: Key.snapshotFolderBookmark) }
+        set { defaults.set(newValue, forKey: Key.snapshotFolderBookmark) }
+    }
+
+    /// Whether the "snap" voice command is listening. Backed directly by UserDefaults so
+    /// the toggle persists immediately, without an explicit "Save Settings".
+    var isVoiceCommandEnabled: Bool {
+        get { defaults.bool(forKey: Key.voiceCommandEnabled) }
+        set { defaults.set(newValue, forKey: Key.voiceCommandEnabled) }
+    }
+
+    // MARK: - Storage
+    private let defaults: UserDefaults
+    private let domain: String?
 
     // MARK: - Singleton
-    static let shared: QCSettingsManager = QCSettingsManager()
+    static let shared = QCSettingsManager()
 
-    private init() {
+    private convenience init() {
+        self.init(defaults: .standard, domain: Bundle.main.bundleIdentifier)
+    }
+
+    /// Lets tests run against a throwaway suite instead of the app's real preferences.
+    init(defaults: UserDefaults, domain: String?) {
+        self.defaults = defaults
+        self.domain = domain
         loadSettings()
-    }
-
-    // MARK: - Property Setters
-    func setMirrored(_ value: Bool) {
-        isMirrored = value
-    }
-
-    func setUpsideDown(_ value: Bool) {
-        isUpsideDown = value
-    }
-
-    func setBorderless(_ value: Bool) {
-        isBorderless = value
-    }
-
-    func setAspectRatioFixed(_ value: Bool) {
-        isAspectRatioFixed = value
-    }
-
-    func setPosition(_ value: Int) {
-        position = value
-    }
-
-    func setDeviceName(_ value: String) {
-        deviceName = value
-    }
-
-    func setFrameProperties(x: Float, y: Float, width: Float, height: Float) {
-        frameX = x
-        frameY = y
-        frameWidth = width
-        frameHeight = height
     }
 
     // MARK: - Settings Management
     func loadSettings() {
         logSettings(label: "before loadSettings")
 
-        savedDeviceName = UserDefaults.standard.object(forKey: "deviceName") as? String ?? ""
-        isBorderless = UserDefaults.standard.object(forKey: "borderless") as? Bool ?? false
-        isMirrored = UserDefaults.standard.object(forKey: "mirrored") as? Bool ?? false
-        isUpsideDown = UserDefaults.standard.object(forKey: "upsideDown") as? Bool ?? false
-        isAspectRatioFixed =
-            UserDefaults.standard.object(forKey: "aspectRatioFixed") as? Bool ?? false
-        position = UserDefaults.standard.object(forKey: "position") as? Int ?? 0
+        savedDeviceName = defaults.string(forKey: Key.deviceName) ?? ""
+        isBorderless = defaults.bool(forKey: Key.borderless)
+        isMirrored = defaults.bool(forKey: Key.mirrored)
+        isUpsideDown = defaults.bool(forKey: Key.upsideDown)
+        isAspectRatioFixed = defaults.bool(forKey: Key.aspectRatioFixed)
+        position = defaults.integer(forKey: Key.position)
 
-        frameWidth = UserDefaults.standard.object(forKey: "frameW") as? Float ?? 0
-        frameHeight = UserDefaults.standard.object(forKey: "frameH") as? Float ?? 0
-        if 100 < frameWidth && 100 < frameHeight {
-            frameX = UserDefaults.standard.object(forKey: "frameX") as? Float ?? 100
-            frameY = UserDefaults.standard.object(forKey: "frameY") as? Float ?? 100
-            NSLog("loaded : x:%f,y:%f,w:%f,h:%f", frameX, frameY, frameWidth, frameHeight)
+        // a saved frame is only usable if it has real dimensions
+        let width = CGFloat(defaults.float(forKey: Key.frameWidth))
+        let height = CGFloat(defaults.float(forKey: Key.frameHeight))
+        if width > 100 && height > 100 {
+            let x = CGFloat(defaults.object(forKey: Key.frameX) as? Float ?? 100)
+            let y = CGFloat(defaults.object(forKey: Key.frameY) as? Float ?? 100)
+            windowFrame = NSRect(x: x, y: y, width: width, height: height)
+            logger.debug("loaded : x:\(x),y:\(y),w:\(width),h:\(height)")
+        } else {
+            windowFrame = nil
         }
 
         logSettings(label: "after loadSettings")
@@ -81,33 +94,42 @@ class QCSettingsManager {
 
     func saveSettings() {
         logSettings(label: "saveSettings")
-        UserDefaults.standard.set(deviceName, forKey: "deviceName")
-        UserDefaults.standard.set(isBorderless, forKey: "borderless")
-        UserDefaults.standard.set(isMirrored, forKey: "mirrored")
-        UserDefaults.standard.set(isUpsideDown, forKey: "upsideDown")
-        UserDefaults.standard.set(isAspectRatioFixed, forKey: "aspectRatioFixed")
-        UserDefaults.standard.set(position, forKey: "position")
-        UserDefaults.standard.set(frameX, forKey: "frameX")
-        UserDefaults.standard.set(frameY, forKey: "frameY")
-        UserDefaults.standard.set(frameWidth, forKey: "frameW")
-        UserDefaults.standard.set(frameHeight, forKey: "frameH")
+
+        defaults.set(deviceName, forKey: Key.deviceName)
+        defaults.set(isBorderless, forKey: Key.borderless)
+        defaults.set(isMirrored, forKey: Key.mirrored)
+        defaults.set(isUpsideDown, forKey: Key.upsideDown)
+        defaults.set(isAspectRatioFixed, forKey: Key.aspectRatioFixed)
+        defaults.set(position, forKey: Key.position)
+
+        if let windowFrame {
+            defaults.set(Float(windowFrame.minX), forKey: Key.frameX)
+            defaults.set(Float(windowFrame.minY), forKey: Key.frameY)
+            defaults.set(Float(windowFrame.width), forKey: Key.frameWidth)
+            defaults.set(Float(windowFrame.height), forKey: Key.frameHeight)
+        }
     }
 
     func clearSettings() {
-        if let appDomain = Bundle.main.bundleIdentifier {
-            UserDefaults.standard.removePersistentDomain(forName: appDomain)
+        if let domain {
+            defaults.removePersistentDomain(forName: domain)
         }
         loadSettings()  // Reset to defaults
     }
 
     func logSettings(label: String) {
-        NSLog(
-            "%@ : %@,%@,%@borderless,%@mirrored,%@upsideDown,%@aspectRetioFixed,position:%d",
-            label, deviceName, savedDeviceName,
-            isBorderless ? "+" : "-",
-            isMirrored ? "+" : "-",
-            isUpsideDown ? "+" : "-",
-            isAspectRatioFixed ? "+" : "-",
-            position)
+        logger.debug(
+            """
+            \(label, privacy: .public) : \(self.deviceName, privacy: .public),\
+            \(self.savedDeviceName, privacy: .public),\
+            \(self.isBorderless ? "+" : "-", privacy: .public)borderless,\
+            \(self.isMirrored ? "+" : "-", privacy: .public)mirrored,\
+            \(self.isUpsideDown ? "+" : "-", privacy: .public)upsideDown,\
+            \(self.isAspectRatioFixed ? "+" : "-", privacy: .public)aspectRatioFixed,\
+            \(self.snapshotFolderBookmark != nil ? "+" : "-", privacy: .public)snapshotFolder,\
+            \(self.isVoiceCommandEnabled ? "+" : "-", privacy: .public)voiceCommand,\
+            position:\(self.position)
+            """
+        )
     }
 }

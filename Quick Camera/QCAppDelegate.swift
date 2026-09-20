@@ -1,16 +1,39 @@
-import AVFoundation
-import AVKit
+/* AVFoundation predates Swift concurrency annotations. AVCaptureSession is documented as safe to
+   drive from a dedicated serial queue, which is what sessionQueue does, so the Sendable warnings
+   it raises are not meaningful here. */
+@preconcurrency import AVFoundation
 import Cocoa
+import CoreImage
+import UniformTypeIdentifiers
+import os
 
 // MARK: - QCAppDelegate Class
-@NSApplicationMain
-class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
+@main
+@MainActor
+final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate,
+    AVCaptureVideoDataOutputSampleBufferDelegate, QCVoiceListenerDelegate
+{
 
     // MARK: - USB Watcher
     let usb: QCUsbWatcher = QCUsbWatcher()
     func deviceCountChanged() {
         self.detectVideoDevices()
         self.startCaptureWithVideoDevice(defaultDevice: selectedDeviceIndex)
+    }
+
+    // MARK: - Voice Listener
+    let voiceListener: QCVoiceListener = QCVoiceListener()
+    private var voiceCommandMenuItem: NSMenuItem?
+
+    func voiceListenerDidHearTrigger() {
+        logger.info("Voice command heard - capturing snapshot")
+        Task { await captureSnapshot() }
+    }
+
+    func voiceListener(failedWith message: String) {
+        isVoiceCommandEnabled = false
+        voiceCommandMenuItem?.state = .off
+        self.errorMessage(message: message)
     }
 
     // MARK: - Interface Builder Outlets
@@ -23,29 +46,35 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
     @IBOutlet weak var playerView: NSView!
 
     // MARK: - Settings Properties
+    private var settings: QCSettingsManager { QCSettingsManager.shared }
+
     var isMirrored: Bool {
-        get { QCSettingsManager.shared.isMirrored }
-        set { QCSettingsManager.shared.setMirrored(newValue) }
+        get { settings.isMirrored }
+        set { settings.isMirrored = newValue }
     }
     var isUpsideDown: Bool {
-        get { QCSettingsManager.shared.isUpsideDown }
-        set { QCSettingsManager.shared.setUpsideDown(newValue) }
+        get { settings.isUpsideDown }
+        set { settings.isUpsideDown = newValue }
     }
     var position: Int {
-        get { QCSettingsManager.shared.position }
-        set { QCSettingsManager.shared.setPosition(newValue) }
+        get { settings.position }
+        set { settings.position = newValue }
     }
     var isBorderless: Bool {
-        get { QCSettingsManager.shared.isBorderless }
-        set { QCSettingsManager.shared.setBorderless(newValue) }
+        get { settings.isBorderless }
+        set { settings.isBorderless = newValue }
     }
     var isAspectRatioFixed: Bool {
-        get { QCSettingsManager.shared.isAspectRatioFixed }
-        set { QCSettingsManager.shared.setAspectRatioFixed(newValue) }
+        get { settings.isAspectRatioFixed }
+        set { settings.isAspectRatioFixed = newValue }
     }
     var deviceName: String {
-        get { QCSettingsManager.shared.deviceName }
-        set { QCSettingsManager.shared.setDeviceName(newValue) }
+        get { settings.deviceName }
+        set { settings.deviceName = newValue }
+    }
+    var isVoiceCommandEnabled: Bool {
+        get { settings.isVoiceCommandEnabled }
+        set { settings.isVoiceCommandEnabled = newValue }
     }
 
     // MARK: - Window Properties
@@ -54,12 +83,28 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
     let defaultDeviceIndex: Int = 0
     var selectedDeviceIndex: Int = 0
 
-    var savedDeviceName: String = "-"
     var devices: [AVCaptureDevice]!
     var captureSession: AVCaptureSession!
     var captureLayer: AVCaptureVideoPreviewLayer!
+    var videoOutput: AVCaptureVideoDataOutput!
 
     var input: AVCaptureDeviceInput!
+
+    // MARK: - Capture Queues
+    /* startRunning/stopRunning block, so session work stays off the main thread. AVCaptureSession
+       has no async API and requires a serial queue, so GCD remains the right tool here. */
+    private let sessionQueue = DispatchQueue(label: "com.jasonkristian.QCamera.session")
+    private let videoDataQueue = DispatchQueue(label: "com.jasonkristian.QCamera.videoData")
+
+    /// Written by captureOutput and read via videoDataQueue.sync, so videoDataQueue -
+    /// not the main actor - serialises access to it.
+    private nonisolated(unsafe) var latestFrame: CVImageBuffer?
+
+    /// Reused across snapshots; building a CIContext per capture is expensive.
+    private let ciContext = CIContext()
+
+    // MARK: - Logging
+    private let logger = Logger(subsystem: "com.jasonkristian.QCamera", category: "QCAppDelegate")
 
     // MARK: - Error Handling
     func errorMessage(message: String) {
@@ -70,9 +115,9 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
 
     // MARK: - Device Management
     func detectVideoDevices() {
-        NSLog("Detecting video devices...")
+        logger.info("Detecting video devices...")
         let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInWideAngleCamera, .externalUnknown],
+            deviceTypes: [.builtInWideAngleCamera, .external],
             mediaType: .video,
             position: .unspecified)
         self.devices = discoverySession.devices
@@ -83,72 +128,78 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
             popup.runModal()
             NSApp.terminate(nil)
         } else {
-            NSLog("%d devices found", devices.count)
+            logger.info("\(self.devices.count) devices found")
         }
 
         let deviceMenu: NSMenu = NSMenu()
-        var deviceIndex: Int = 0
 
         // Here we need to keep track of the current device (if selected) in order to keep it checked in the menu
         var currentDevice: AVCaptureDevice = self.devices[defaultDeviceIndex]
-        if self.captureSession != nil {
-            currentDevice = (self.captureSession.inputs[0] as! AVCaptureDeviceInput).device
+        if self.captureSession != nil, let activeDevice = self.input?.device {
+            currentDevice = activeDevice
         } else {
-            NSLog("first time - loadSettings")
+            logger.info("first time - loadSettings")
             self.loadSettings()
         }
         self.selectedDeviceIndex = defaultDeviceIndex
 
-        for device: AVCaptureDevice in self.devices {
+        for (deviceIndex, device) in self.devices.enumerated() {
             let deviceMenuItem: NSMenuItem = NSMenuItem(
                 title: device.localizedName, action: #selector(deviceMenuChanged), keyEquivalent: ""
             )
             deviceMenuItem.target = self
             deviceMenuItem.representedObject = deviceIndex
             if device == currentDevice {
-                deviceMenuItem.state = NSControl.StateValue.on
+                deviceMenuItem.state = .on
                 self.selectedDeviceIndex = deviceIndex
             }
             if deviceIndex < 9 {
                 deviceMenuItem.keyEquivalent = String(deviceIndex + 1)
             }
             deviceMenu.addItem(deviceMenuItem)
-            deviceIndex += 1
         }
         selectSourceMenu.submenu = deviceMenu
     }
 
     func startCaptureWithVideoDevice(defaultDevice: Int) {
-        NSLog("Starting capture with device index %d", defaultDevice)
+        logger.info("Starting capture with device index \(defaultDevice)")
         let device: AVCaptureDevice = self.devices[defaultDevice]
 
         if captureSession != nil {
 
             // if we are "restarting" a session but the device is the same exit early
-            let currentDevice: AVCaptureDevice =
-                (self.captureSession.inputs[0] as! AVCaptureDeviceInput).device
-            guard currentDevice != device else { return }
+            guard self.input?.device != device else { return }
 
-            captureSession.stopRunning()
+            let oldSession = captureSession
+            sessionQueue.async { oldSession?.stopRunning() }
         }
         captureSession = AVCaptureSession()
 
         do {
             self.input = try AVCaptureDeviceInput(device: device)
             self.captureSession.addInput(input)
-            self.captureSession.startRunning()
+
+            // keep the most recent frame available for snapshot capture
+            self.videoOutput = AVCaptureVideoDataOutput()
+            self.videoOutput.alwaysDiscardsLateVideoFrames = true
+            self.videoOutput.setSampleBufferDelegate(self, queue: videoDataQueue)
+            if self.captureSession.canAddOutput(self.videoOutput) {
+                self.captureSession.addOutput(self.videoOutput)
+            }
+
             self.captureLayer = AVCaptureVideoPreviewLayer(session: self.captureSession)
-            self.captureLayer.connection?.automaticallyAdjustsVideoMirroring = false
-            self.captureLayer.connection?.isVideoMirrored = false
 
             self.playerView.layer = self.captureLayer
             self.playerView.layer?.backgroundColor = CGColor.black
-            self.windowTitle = String(format: "Quick Camera: [%@]", device.localizedName)
+            self.windowTitle = "Quick Camera: [\(device.localizedName)]"
             self.window.title = self.windowTitle
             self.deviceName = device.localizedName
             self.applySettings()
+
+            let session = self.captureSession
+            sessionQueue.async { session?.startRunning() }
         } catch {
-            NSLog("Error while opening device")
+            logger.error("Error while opening device: \(error.localizedDescription, privacy: .public)")
             self.errorMessage(
                 message:
                     "Unfortunately, there was an error when trying to access the camera. Try again or select a different one."
@@ -156,137 +207,107 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
         }
     }
 
-    // MARK: - Settings Management
-    func logSettings(label: String) {
-        QCSettingsManager.shared.logSettings(label: label)
+    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+    nonisolated func captureOutput(
+        _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        // called on videoDataQueue, which owns latestFrame
+        latestFrame = CMSampleBufferGetImageBuffer(sampleBuffer)
     }
 
+    // MARK: - Settings Management
     func loadSettings() {
-        QCSettingsManager.shared.loadSettings()
+        settings.loadSettings()
 
         if self.isBorderless {
             self.removeBorder()
         }
 
-        let savedW = QCSettingsManager.shared.frameWidth
-        let savedH = QCSettingsManager.shared.frameHeight
-        if 100 < savedW && 100 < savedH {
-            let savedX = QCSettingsManager.shared.frameX
-            let savedY = QCSettingsManager.shared.frameY
-            NSLog("loaded : x:%f,y:%f,w:%f,h:%f", savedX, savedY, savedW, savedH)
-            var currentSize: CGSize = self.window.contentLayoutRect.size
-            currentSize.width = CGFloat(savedW)
-            currentSize.height = CGFloat(savedH)
-            self.window.setContentSize(currentSize)
-            self.window.setFrameOrigin(NSPoint(x: CGFloat(savedX), y: CGFloat(savedY)))
+        if let frame = settings.windowFrame {
+            self.window.setContentSize(frame.size)
+            self.window.setFrameOrigin(frame.origin)
         }
     }
 
+    /* the preview layer and the snapshot video output each have their own connection,
+       so display transformations are applied to both to keep saved images matching the screen */
+    private var videoConnections: [AVCaptureConnection] {
+        var connections: [AVCaptureConnection] = []
+        if let previewConnection = captureLayer?.connection {
+            connections.append(previewConnection)
+        }
+        if let outputConnection = videoOutput?.connection(with: .video) {
+            connections.append(outputConnection)
+        }
+        return connections
+    }
+
     func applySettings() {
-        QCSettingsManager.shared.logSettings(label: "applySettings")
+        settings.logSettings(label: "applySettings")
 
         self.setRotation(self.position)
-        self.captureLayer.connection?.isVideoMirrored = isMirrored
+        for connection in videoConnections {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = isMirrored
+        }
         self.fixAspectRatio()
 
-        self.borderlessMenu.state = convertToNSControlStateValue(
-            (isBorderless ? NSControl.StateValue.on.rawValue : NSControl.StateValue.off.rawValue))
-        self.mirroredMenu.state = convertToNSControlStateValue(
-            (isMirrored ? NSControl.StateValue.on.rawValue : NSControl.StateValue.off.rawValue))
-        self.upsideDownMenu.state = convertToNSControlStateValue(
-            (isUpsideDown ? NSControl.StateValue.on.rawValue : NSControl.StateValue.off.rawValue))
-        self.aspectRatioFixedMenu.state = convertToNSControlStateValue(
-            (isAspectRatioFixed
-                ? NSControl.StateValue.on.rawValue : NSControl.StateValue.off.rawValue))
+        self.borderlessMenu.state = isBorderless ? .on : .off
+        self.mirroredMenu.state = isMirrored ? .on : .off
+        self.upsideDownMenu.state = isUpsideDown ? .on : .off
+        self.aspectRatioFixedMenu.state = isAspectRatioFixed ? .on : .off
     }
 
     // MARK: - Settings Actions
     @IBAction func saveSettings(_ sender: NSMenuItem) {
-        QCSettingsManager.shared.setFrameProperties(
-            x: Float(self.window.frame.minX),
-            y: Float(self.window.frame.minY),
-            width: Float(self.window.frame.width),
-            height: Float(self.window.frame.height)
-        )
-        QCSettingsManager.shared.saveSettings()
+        settings.windowFrame = self.window.frame
+        settings.saveSettings()
     }
 
     @IBAction func clearSettings(_ sender: NSMenuItem) {
-        QCSettingsManager.shared.clearSettings()
+        settings.clearSettings()
     }
 
     // MARK: - Display Actions
     @IBAction func mirrorHorizontally(_ sender: NSMenuItem) {
-        NSLog("Mirror image menu item selected")
+        logger.info("Mirror image menu item selected")
         isMirrored = !isMirrored
         self.applySettings()
     }
 
     func setRotation(_ position: Int) {
-        switch position {
-        case 1:
-            if !isUpsideDown {
-                self.captureLayer.connection?.videoOrientation =
-                    AVCaptureVideoOrientation.landscapeLeft
-            } else {
-                self.captureLayer.connection?.videoOrientation =
-                    AVCaptureVideoOrientation.landscapeRight
+        for connection in videoConnections {
+            let angle = QCRotation.angle(position: position, isUpsideDown: isUpsideDown)
+            if connection.isVideoRotationAngleSupported(angle) {
+                connection.videoRotationAngle = angle
             }
-            break
-        case 2:
-            if !isUpsideDown {
-                self.captureLayer.connection?.videoOrientation =
-                    AVCaptureVideoOrientation.portraitUpsideDown
-            } else {
-                self.captureLayer.connection?.videoOrientation = AVCaptureVideoOrientation.portrait
-            }
-            break
-        case 3:
-            if !isUpsideDown {
-                self.captureLayer.connection?.videoOrientation =
-                    AVCaptureVideoOrientation.landscapeRight
-            } else {
-                self.captureLayer.connection?.videoOrientation =
-                    AVCaptureVideoOrientation.landscapeLeft
-            }
-            break
-        case 0:
-            if !isUpsideDown {
-                self.captureLayer.connection?.videoOrientation = AVCaptureVideoOrientation.portrait
-            } else {
-                self.captureLayer.connection?.videoOrientation =
-                    AVCaptureVideoOrientation.portraitUpsideDown
-            }
-            break
-        default: break
         }
     }
 
     @IBAction func mirrorVertically(_ sender: NSMenuItem) {
-        NSLog("Mirror image vertically menu item selected")
+        logger.info("Mirror image vertically menu item selected")
         isUpsideDown = !isUpsideDown
         self.applySettings()
     }
 
-    func swapWH() {
+    func swapWindowWidthAndHeight() {
         var currentSize: CGSize = self.window.contentLayoutRect.size
         swap(&currentSize.height, &currentSize.width)
         self.window.setContentSize(currentSize)
     }
 
     @IBAction func rotateLeft(_ sender: NSMenuItem) {
-        NSLog("Rotate Left menu item selected with position %d", position)
-        position = position - 1
-        if position == -1 { position = 3 }
-        self.swapWH()
+        logger.info("Rotate Left menu item selected with position \(self.position)")
+        position = QCRotation.rotatedLeft(from: position)
+        self.swapWindowWidthAndHeight()
         self.applySettings()
     }
 
     @IBAction func rotateRight(_ sender: NSMenuItem) {
-        NSLog("Rotate Right menu item selected with position %d", position)
-        position = position + 1
-        if position == 4 { position = 0 }
-        self.swapWH()
+        logger.info("Rotate Right menu item selected with position \(self.position)")
+        position = QCRotation.rotatedRight(from: position)
+        self.swapWindowWidthAndHeight()
         self.applySettings()
     }
 
@@ -294,26 +315,25 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
     private func addBorder() {
         window.styleMask = defaultBorderStyle
         window.title = self.windowTitle
-        self.window.level = convertToNSWindowLevel(Int(CGWindowLevelForKey(.normalWindow)))
+        self.window.level = .normal
         window.isMovableByWindowBackground = false
     }
 
     private func removeBorder() {
         defaultBorderStyle = window.styleMask
-        self.window.styleMask = [NSWindow.StyleMask.borderless, NSWindow.StyleMask.resizable]
-        self.window.level = convertToNSWindowLevel(Int(CGWindowLevelForKey(.maximumWindow)))
+        self.window.styleMask = [.borderless, .resizable]
+        self.window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.maximumWindow)))
         window.isMovableByWindowBackground = true
     }
 
     @IBAction func borderless(_ sender: NSMenuItem) {
-        NSLog("Borderless menu item selected")
+        logger.info("Borderless menu item selected")
         if self.window.styleMask.contains(.fullScreen) {
-            NSLog("Ignoring borderless command as window is full screen")
+            logger.info("Ignoring borderless command as window is full screen")
             return
         }
         isBorderless = !isBorderless
-        sender.state = convertToNSControlStateValue(
-            (isBorderless ? NSControl.StateValue.on.rawValue : NSControl.StateValue.off.rawValue))
+        sender.state = isBorderless ? .on : .off
         if isBorderless {
             removeBorder()
         } else {
@@ -323,150 +343,285 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
     }
 
     @IBAction func enterFullScreen(_ sender: NSMenuItem) {
-        NSLog("Enter full screen menu item selected")
+        logger.info("Enter full screen menu item selected")
         playerView.window?.toggleFullScreen(self)
         // no effect when borderless is enabled ?
     }
 
     @IBAction func toggleFixAspectRatio(_ sender: NSMenuItem) {
         isAspectRatioFixed = !isAspectRatioFixed
-        sender.state = convertToNSControlStateValue(
-            (isAspectRatioFixed
-                ? NSControl.StateValue.on.rawValue : NSControl.StateValue.off.rawValue))
+        sender.state = isAspectRatioFixed ? .on : .off
         fixAspectRatio()
     }
 
-    func isLandscape() -> Bool {
-        return position % 2 == 0
+    var isLandscape: Bool { QCRotation.isLandscape(position: position) }
+
+    /// Native pixel dimensions of the active camera format, oriented to match the current rotation.
+    private var activeVideoSize: CGSize? {
+        guard let dimensions = input?.device.activeFormat.formatDescription.dimensions else {
+            return nil
+        }
+        let width = CGFloat(dimensions.width)
+        let height = CGFloat(dimensions.height)
+        return isLandscape ? CGSize(width: width, height: height) : CGSize(width: height, height: width)
     }
 
     func fixAspectRatio() {
-        if isAspectRatioFixed, #available(OSX 10.15, *) {
-            let height: Int32 = input.device.activeFormat.formatDescription.dimensions.height
-            let width: Int32 = input.device.activeFormat.formatDescription.dimensions.width
-            let size: NSSize =
-                self.isLandscape()
-                ? NSMakeSize(CGFloat(width), CGFloat(height))
-                : NSMakeSize(CGFloat(height), CGFloat(width))
-            self.window.contentAspectRatio = size
-
-            let ratio: CGFloat = CGFloat(Float(width) / Float(height))
-            var currentSize: CGSize = self.window.contentLayoutRect.size
-            if self.isLandscape() {
-                currentSize.height = currentSize.width / ratio
-            } else {
-                currentSize.height = currentSize.width * ratio
-            }
-            NSLog(
-                "fixAspectRatio : %f - %d,%d - %f,%f - %f,%f", ratio, width, height, size.width,
-                size.height, currentSize.width, currentSize.height)
-            self.window.setContentSize(currentSize)
-        } else {
+        guard isAspectRatioFixed, let size = activeVideoSize else {
             self.window.contentResizeIncrements = NSMakeSize(1.0, 1.0)
+            return
         }
+        self.window.contentAspectRatio = size
+
+        var currentSize: CGSize = self.window.contentLayoutRect.size
+        currentSize.height = currentSize.width * (size.height / size.width)
+        logger.debug(
+            "fixAspectRatio : \(size.width),\(size.height) - \(currentSize.width),\(currentSize.height)"
+        )
+        self.window.setContentSize(currentSize)
     }
 
     @IBAction func fitToActualSize(_ sender: NSMenuItem) {
-        if #available(OSX 10.15, *) {
-            let height: Int32 = input.device.activeFormat.formatDescription.dimensions.height
-            let width: Int32 = input.device.activeFormat.formatDescription.dimensions.width
-            var currentSize: CGSize = self.window.contentLayoutRect.size
-            currentSize.width = CGFloat(self.isLandscape() ? width : height)
-            currentSize.height = CGFloat(self.isLandscape() ? height : width)
-            self.window.setContentSize(currentSize)
-        }
+        guard let size = activeVideoSize else { return }
+        self.window.setContentSize(size)
     }
 
     @IBAction func saveImage(_ sender: NSMenuItem) {
-        if self.window.styleMask.contains(.fullScreen) {
-            NSLog("Save is not supported as window is full screen")
+        Task { await captureSnapshot() }
+    }
+
+    @objc func setSnapshotsFolder(_ sender: NSMenuItem) {
+        Task { _ = await promptForSnapshotFolder() }
+    }
+
+    /// Captures the current camera frame and saves it silently to the snapshots
+    /// folder, asking the user to choose one first if none is set.
+    func captureSnapshot() async {
+        guard captureSession != nil else { return }
+        guard let cgImage = currentFrameImage() else {
+            logger.error("No video frame available to save")
+            self.errorMessage(
+                message: "Unfortunately, there is no camera image available to save yet.")
             return
         }
 
-        if captureSession != nil {
-            if #available(OSX 10.12, *) {
-                // turn borderless on, capture image, return border to previous state
-                let borderlessState: Bool = self.isBorderless
-                if borderlessState == false {
-                    NSLog("Removing border")
-                    self.removeBorder()
-                }
+        // ?? can't take an async right-hand side, so the fallback prompt is spelled out
+        var folder: URL? = resolveSnapshotFolder()
+        if folder == nil {
+            folder = await promptForSnapshotFolder()
+        }
+        guard let folder else { return }
+        saveSnapshot(cgImage, in: folder)
+    }
 
-                /* Pause the RunLoop for 0.1 sec to let the window repaint after removing the border - I'm not a fan of this approach
-                   but can't find another way to listen to an event for the window being updated. PRs welcome :) */
-                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+    /* the video output connection already applies the same rotation and mirroring
+       as the on-screen preview, so the frame is used as delivered */
+    private func currentFrameImage() -> CGImage? {
+        guard let frame = videoDataQueue.sync(execute: { latestFrame }) else { return nil }
+        let ciImage: CIImage = CIImage(cvImageBuffer: frame)
+        return ciContext.createCGImage(ciImage, from: ciImage.extent)
+    }
 
-                let cgImage: CGImage? = CGWindowListCreateImage(
-                    CGRect.null, .optionIncludingWindow, CGWindowID(self.window.windowNumber),
-                    [.boundsIgnoreFraming, .bestResolution])
+    private func saveSnapshot(_ cgImage: CGImage, in folder: URL) {
+        let accessing: Bool = folder.startAccessingSecurityScopedResource()
+        defer { if accessing { folder.stopAccessingSecurityScopedResource() } }
 
-                if borderlessState == false {
-                    self.addBorder()
-                }
+        let fileURL: URL = QCSnapshotFile.uniqueURL(
+            forFilename: QCSnapshotFile.filename(for: Date.now), in: folder)
+        guard
+            let destination = CGImageDestinationCreateWithURL(
+                fileURL as CFURL, UTType.png.identifier as CFString, 1, nil)
+        else {
+            logger.error("Could not create image destination for \(fileURL.path, privacy: .public)")
+            self.errorMessage(
+                message: "Unfortunately, the image could not be saved to the snapshots folder.")
+            return
+        }
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        if CGImageDestinationFinalize(destination) {
+            logger.info("Saved snapshot to \(fileURL.path, privacy: .public)")
+            flashPreview()
+        } else {
+            logger.error("Could not write snapshot to \(fileURL.path, privacy: .public)")
+            self.errorMessage(
+                message: "Unfortunately, the image could not be saved to the snapshots folder.")
+        }
+    }
 
-                DispatchQueue.main.async {
-                    let now: Date = Date()
-                    let dateFormatter: DateFormatter = DateFormatter()
-                    dateFormatter.dateFormat = "yyyy-MM-dd"
-                    let date: String = dateFormatter.string(from: now)
-                    dateFormatter.dateFormat = "h.mm.ss a"
-                    let time: String = dateFormatter.string(from: now)
+    /* Shutter-style flash to confirm the snapshot. A sound would be the obvious choice,
+       but NSSound trips a sandbox mach-lookup denial for com.apple.audioanalyticsd. */
+    private func flashPreview() {
+        guard let hostLayer = playerView.layer else { return }
+        let flashLayer: CALayer = CALayer()
+        flashLayer.frame = playerView.bounds
+        flashLayer.backgroundColor = CGColor.white
+        flashLayer.opacity = 0
+        hostLayer.addSublayer(flashLayer)
 
-                    let panel: NSSavePanel = NSSavePanel()
-                    panel.nameFieldStringValue = String(
-                        format: "Quick Camera Image %@ at %@.png", date, time)
-                    panel.beginSheetModal(for: self.window) {
-                        (result: NSApplication.ModalResponse) in
-                        if result == NSApplication.ModalResponse.OK {
-                            NSLog(panel.url!.absoluteString)
-                            let destination: CGImageDestination? = CGImageDestinationCreateWithURL(
-                                panel.url! as CFURL, UTType.png.identifier as CFString, 1, nil)
-                            if destination == nil {
-                                NSLog(
-                                    "Could not write file - destination returned from CGImageDestinationCreateWithURL was nil"
-                                )
-                                self.errorMessage(
-                                    message:
-                                        "Unfortunately, the image could not be saved to this location."
-                                )
-                            } else {
-                                CGImageDestinationAddImage(destination!, cgImage!, nil)
-                                CGImageDestinationFinalize(destination!)
-                            }
-                        }
-                    }
-                }
-            } else {
-                let popup: NSAlert = NSAlert()
-                popup.messageText =
-                    "Unfortunately, saving images is only supported in Mac OSX 10.12 (Sierra) and higher."
-                popup.runModal()
-            }
+        let animation: CABasicAnimation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 0.85
+        animation.toValue = 0
+        animation.duration = 0.25
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { flashLayer.removeFromSuperlayer() }
+        flashLayer.add(animation, forKey: "flash")
+        CATransaction.commit()
+    }
+
+    private func resolveSnapshotFolder() -> URL? {
+        guard let bookmark = settings.snapshotFolderBookmark else { return nil }
+        var isStale: Bool = false
+        guard
+            let url = try? URL(
+                resolvingBookmarkData: bookmark, options: .withSecurityScope, relativeTo: nil,
+                bookmarkDataIsStale: &isStale)
+        else { return nil }
+        if isStale,
+            let refreshed = try? url.bookmarkData(
+                options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+        {
+            settings.snapshotFolderBookmark = refreshed
+        }
+        return url
+    }
+
+    private func promptForSnapshotFolder() async -> URL? {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel: NSOpenPanel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose a folder where snapshots will be saved"
+
+        guard await panel.begin() == .OK, let url = panel.url else { return nil }
+        do {
+            settings.snapshotFolderBookmark = try url.bookmarkData(
+                options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+            return url
+        } catch {
+            logger.error(
+                "Could not create bookmark for snapshots folder: \(error.localizedDescription, privacy: .public)"
+            )
+            self.errorMessage(message: "Unfortunately, that folder could not be used for snapshots.")
+            return nil
         }
     }
 
     // MARK: - Device Menu Actions
     @objc func deviceMenuChanged(_ sender: NSMenuItem) {
-        NSLog("Device Menu changed")
-        if sender.state == NSControl.StateValue.on {
+        logger.info("Device Menu changed")
+        guard sender.state != .on, let deviceIndex = sender.representedObject as? Int else {
             // selected the active device, so nothing to do here
             return
         }
 
         // set the checkbox on the currently selected device
-        for menuItem: NSMenuItem in selectSourceMenu.submenu!.items {
-            menuItem.state = NSControl.StateValue.off
+        for menuItem in selectSourceMenu.submenu?.items ?? [] {
+            menuItem.state = .off
         }
-        sender.state = NSControl.StateValue.on
+        sender.state = .on
 
-        self.startCaptureWithVideoDevice(defaultDevice: sender.representedObject as! Int)
+        self.startCaptureWithVideoDevice(defaultDevice: deviceIndex)
     }
 
     // MARK: - Application Lifecycle
+    /// Unit tests load the app as their host process; opening the camera for them is pointless
+    /// (and turns the camera light on), so startup stops short of starting a capture session.
+    private var isRunningTests: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+            || environment["XCTestSessionIdentifier"] != nil
+    }
+
     func applicationDidFinishLaunching(_ aNotification: Notification) {
+        guard !isRunningTests else { return }
+
+        usb.delegate = self
+        voiceListener.delegate = self
+        addSnapshotMenuItems()
+        startVoiceListenerIfEnabled()
+
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            startCapture()
+        case .notDetermined:
+            Task {
+                if await AVCaptureDevice.requestAccess(for: .video) {
+                    startCapture()
+                } else {
+                    reportCameraAccessDenied()
+                }
+            }
+        default:
+            reportCameraAccessDenied()
+        }
+    }
+
+    private func startCapture() {
         detectVideoDevices()
         startCaptureWithVideoDevice(defaultDevice: defaultDeviceIndex)
-        usb.delegate = self
+    }
+
+    private func reportCameraAccessDenied() {
+        logger.error("Camera access was denied")
+        errorMessage(
+            message:
+                "Quick Camera needs permission to use the camera. Grant access in System Settings > Privacy & Security > Camera, then open Quick Camera again."
+        )
+        NSApp.terminate(nil)
+    }
+
+    /* the menu is defined in MainMenu.xib; inserting these items programmatically
+       next to Save Image avoids hand-editing the XIB */
+    private func addSnapshotMenuItems() {
+        guard
+            let menu = NSApp.mainMenu?.items
+                .compactMap({ $0.submenu })
+                .first(where: { $0.items.contains { $0.action == #selector(saveImage(_:)) } }),
+            let saveIndex = menu.items.firstIndex(where: {
+                $0.action == #selector(saveImage(_:))
+            })
+        else { return }
+        let folderItem: NSMenuItem = NSMenuItem(
+            title: "Set Snapshots Folder…", action: #selector(setSnapshotsFolder(_:)),
+            keyEquivalent: "")
+        folderItem.target = self
+        menu.insertItem(folderItem, at: saveIndex + 1)
+
+        let voiceItem: NSMenuItem = NSMenuItem(
+            title: "Listen for “\(QCVoiceCommand.triggerWord.capitalized)”",
+            action: #selector(toggleVoiceCommand(_:)), keyEquivalent: "")
+        voiceItem.target = self
+        voiceItem.state = isVoiceCommandEnabled ? .on : .off
+        menu.insertItem(voiceItem, at: saveIndex + 2)
+        voiceCommandMenuItem = voiceItem
+    }
+
+    // MARK: - Voice Command Actions
+    @objc func toggleVoiceCommand(_ sender: NSMenuItem) {
+        logger.info("Voice command menu item selected")
+        if voiceListener.isListening {
+            voiceListener.stop()
+            isVoiceCommandEnabled = false
+            sender.state = .off
+        } else {
+            Task {
+                let started = await voiceListener.start()
+                isVoiceCommandEnabled = started
+                sender.state = started ? .on : .off
+            }
+        }
+    }
+
+    private func startVoiceListenerIfEnabled() {
+        guard isVoiceCommandEnabled else { return }
+        Task {
+            let started = await voiceListener.start()
+            isVoiceCommandEnabled = started
+            voiceCommandMenuItem?.state = started ? .on : .off
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -474,13 +629,3 @@ class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate {
     }
 }
 
-// MARK: - Helper Functions
-// Helper function inserted by Swift 4.2 migrator.
-private func convertToNSControlStateValue(_ input: Int) -> NSControl.StateValue {
-    NSControl.StateValue(rawValue: input)
-}
-
-// Helper function inserted by Swift 4.2 migrator.
-private func convertToNSWindowLevel(_ input: Int) -> NSWindow.Level {
-    NSWindow.Level(rawValue: input)
-}

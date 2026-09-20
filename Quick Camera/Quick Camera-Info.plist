@@ -32,6 +32,8 @@
 	<string>Copyright © 2025 Simon Guest. All rights reserved.</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Quick Camera listens for the "snap" voice command so you can save a snapshot hands-free.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

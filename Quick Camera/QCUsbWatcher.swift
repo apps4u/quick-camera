@@ -1,69 +1,35 @@
-import IOKit
-import IOKit.usb
-import IOKit.usb.IOUSBLib
+import AVFoundation
 
 // MARK: - Protocol
+@MainActor
 public protocol QCUsbWatcherDelegate: AnyObject {
     func deviceCountChanged()
 }
 
 // MARK: - QCUsbWatcher Class
-public class QCUsbWatcher {
+/* Watches for video capture devices appearing or disappearing (USB hot-plug, Continuity Camera, etc.)
+   by key-value observing the device list of an AVCaptureDevice.DiscoverySession. Unlike the previous
+   IOKit-based approach, AVFoundation only publishes devices once they are ready for capture, so no
+   settle delay is needed before notifying the delegate. */
+@MainActor
+public final class QCUsbWatcher {
     // MARK: - Properties
     public weak var delegate: QCUsbWatcherDelegate?
-    private let notificationPort: IONotificationPortRef? = IONotificationPortCreate(
-        kIOMainPortDefault)
-    private var addedIterator: io_iterator_t = 0
-    private var removedIterator: io_iterator_t = 0
+    private let discoverySession: AVCaptureDevice.DiscoverySession
+    private var devicesObservation: NSKeyValueObservation?
 
     // MARK: - Initialization
     public init() {
-        func handleNotification(instance: UnsafeMutableRawPointer?, _ iterator: io_iterator_t) {
-            let watcher: QCUsbWatcher = Unmanaged<QCUsbWatcher>.fromOpaque(instance!)
-                .takeUnretainedValue()
-            while case let device:io_object_t = IOIteratorNext(iterator), device != IO_OBJECT_NULL {
+        discoverySession = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera, .external],
+            mediaType: .video,
+            position: .unspecified)
 
-                //give the OS a bit of time to finish setting up capture devices
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    watcher.delegate?.deviceCountChanged()
-                }
-                IOObjectRelease(device)
+        // KVO can fire on any thread, so hop to the main actor before notifying
+        devicesObservation = discoverySession.observe(\.devices) { [weak self] _, _ in
+            Task { @MainActor in
+                self?.delegate?.deviceCountChanged()
             }
-        }
-
-        let query: CFMutableDictionary? = IOServiceMatching(kIOUSBDeviceClassName)
-        let opaqueSelf: UnsafeMutableRawPointer = Unmanaged.passUnretained(self).toOpaque()
-
-        // Watch for connected devices.
-        IOServiceAddMatchingNotification(
-            notificationPort, kIOMatchedNotification, query,
-            handleNotification, opaqueSelf, &addedIterator)
-        consumeInitialUSBEvents(addedIterator)
-
-        // Watch for disconnected devices.
-        IOServiceAddMatchingNotification(
-            notificationPort, kIOTerminatedNotification, query,
-            handleNotification, opaqueSelf, &removedIterator)
-        consumeInitialUSBEvents(removedIterator)
-
-        // Add the notification to the main run loop to receive future updates.
-        CFRunLoopAddSource(
-            CFRunLoopGetMain(),
-            IONotificationPortGetRunLoopSource(notificationPort).takeUnretainedValue(),
-            .commonModes)
-    }
-
-    // MARK: - Deinitialization
-    deinit {
-        IOObjectRelease(addedIterator)
-        IOObjectRelease(removedIterator)
-        IONotificationPortDestroy(notificationPort)
-    }
-
-    // MARK: - Private Methods
-    fileprivate func consumeInitialUSBEvents(_ iterator: io_iterator_t) {
-        while case let device:io_object_t = IOIteratorNext(iterator), device != IO_OBJECT_NULL {
-            IOObjectRelease(device)
         }
     }
 }
