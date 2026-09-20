@@ -159,8 +159,9 @@ final class QCVoiceListener {
 
 /// Converts microphone buffers to the analyzer's required format. Only the audio tap
 /// touches this after creation, and taps deliver buffers serially, so the mutable
-/// converter state is safe despite the Sendable annotation.
-private final class QCVoiceAudioConverter: @unchecked Sendable {
+/// converter state is safe despite the Sendable annotation. Internal (not private)
+/// so the unit tests can exercise it.
+final class QCVoiceAudioConverter: @unchecked Sendable {
     private let outputFormat: AVAudioFormat
     private var converter: AVAudioConverter?
 
