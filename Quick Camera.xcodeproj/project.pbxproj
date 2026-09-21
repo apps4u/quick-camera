@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0612AC94305EBCA9006A315B /* QCRotation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0612AC93305EBCA9006A315B /* QCRotation.swift */; };
 		0612AC96305EBCB4006A315B /* QCSnapshotFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0612AC95305EBCB4006A315B /* QCSnapshotFile.swift */; };
+		0670BD053060E33400C61692 /* QCFocusScore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0670BD043060E33400C61692 /* QCFocusScore.swift */; };
 		068CFB71305F640E00ED8530 /* QCVoiceCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = 068CFB70305F640E00ED8530 /* QCVoiceCommand.swift */; };
 		068CFB73305F642200ED8530 /* QCVoiceListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = 068CFB72305F642200ED8530 /* QCVoiceListener.swift */; };
 		87673A631E35C97A002ECF15 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 87673A621E35C97A002ECF15 /* AVFoundation.framework */; };
@@ -21,10 +22,21 @@
 		F952D6E324E15A6200EA786D /* QCUsbWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = F952D6E224E15A6200EA786D /* QCUsbWatcher.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		0670BD063060E81000C61692 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F4CBD38B16B8CE5F003A4794 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F4CBD39216B8CE5F003A4794;
+			remoteInfo = "Quick Camera";
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		0612AC93305EBCA9006A315B /* QCRotation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QCRotation.swift; sourceTree = "<group>"; };
 		0612AC95305EBCB4006A315B /* QCSnapshotFile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QCSnapshotFile.swift; sourceTree = "<group>"; };
 		0612AC9B305EBD10006A315B /* Quick Camera Tests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Quick Camera Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		0670BD043060E33400C61692 /* QCFocusScore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QCFocusScore.swift; sourceTree = "<group>"; };
 		068CFB70305F640E00ED8530 /* QCVoiceCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QCVoiceCommand.swift; sourceTree = "<group>"; };
 		068CFB72305F642200ED8530 /* QCVoiceListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QCVoiceListener.swift; sourceTree = "<group>"; };
 		87673A621E35C97A002ECF15 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
@@ -122,6 +134,7 @@
 				0612AC95305EBCB4006A315B /* QCSnapshotFile.swift */,
 				068CFB70305F640E00ED8530 /* QCVoiceCommand.swift */,
 				068CFB72305F642200ED8530 /* QCVoiceListener.swift */,
+				0670BD043060E33400C61692 /* QCFocusScore.swift */,
 			);
 			path = "Quick Camera";
 			sourceTree = "<group>";
@@ -140,6 +153,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				0670BD073060E81000C61692 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				0612AC9C305EBD11006A315B /* Quick Camera Tests */,
@@ -243,12 +257,21 @@
 				0612AC96305EBCB4006A315B /* QCSnapshotFile.swift in Sources */,
 				F952D6E324E15A6200EA786D /* QCUsbWatcher.swift in Sources */,
 				F435396A2D1B1B86002188A0 /* QCSettingsManager.swift in Sources */,
+				0670BD053060E33400C61692 /* QCFocusScore.swift in Sources */,
 				068CFB71305F640E00ED8530 /* QCVoiceCommand.swift in Sources */,
 				0612AC94305EBCA9006A315B /* QCRotation.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0670BD073060E81000C61692 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F4CBD39216B8CE5F003A4794 /* Quick Camera */;
+			targetProxy = 0670BD063060E81000C61692 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin PBXVariantGroup section */
 		F4CBD3AB16B8CE5F003A4794 /* MainMenu.xib */ = {

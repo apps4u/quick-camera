@@ -14,7 +14,8 @@ What this fork adds on top of the original Quick Camera:
 
 - **Snapshot capture** — saves the current frame as a PNG, silently, to a folder you choose once (a brief white flash confirms the capture)
 - **Hands-free capture** — opt-in "Listen for “Snap”" voice command, transcribed fully on-device with Apple's SpeechAnalyzer (no audio leaves your Mac)
-- **Unit tests** — rotation maths, snapshot filename handling, voice-trigger matching, and settings persistence are extracted into testable types with a Swift Testing test target
+- **Best-focus capture window** — saying "snap" records for 3 seconds and saves the sharpest frame it saw; say "snap 5" (or "snap five") to pick a 1–5 second window. Sharpness is scored with a Laplacian focus measure on the luma plane
+- **Unit tests** — rotation maths, snapshot filename handling, voice-trigger matching and duration parsing, focus scoring, and settings persistence are extracted into testable types with a Swift Testing test target
 - **Modernised concurrency** — `@MainActor` isolation and async/await throughout
 
 ## Building Quick Camera

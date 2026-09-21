@@ -25,9 +25,15 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
     let voiceListener: QCVoiceListener = QCVoiceListener()
     private var voiceCommandMenuItem: NSMenuItem?
 
-    func voiceListenerDidHearTrigger() {
-        logger.info("Voice command heard - capturing snapshot")
-        Task { await captureSnapshot() }
+    func voiceListenerDidHearTrigger(durationSeconds: TimeInterval?) {
+        let duration = durationSeconds ?? defaultVoiceCaptureDuration
+        logger.info(
+            "Voice command heard - starting capture window for \(duration, privacy: .public)s")
+        startVoiceCaptureWindow(duration: duration)
+    }
+
+    func voiceListenerDidRefineDuration(durationSeconds: TimeInterval) {
+        rescheduleVoiceCaptureWindow(duration: durationSeconds)
     }
 
     func voiceListener(failedWith message: String) {
@@ -102,6 +108,20 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
 
     /// Reused across snapshots; building a CIContext per capture is expensive.
     private let ciContext = CIContext()
+
+    // MARK: - Voice Capture Window
+    /// How long "snap" records for when no duration is spoken.
+    private let defaultVoiceCaptureDuration: TimeInterval = 3.0
+    private var voiceCaptureFinishTask: Task<Void, Never>?
+    private var voiceCaptureStartDate: Date?
+
+    /// Like latestFrame, these are owned by videoDataQueue: captureOutput writes them and the
+    /// main actor reads them via videoDataQueue.sync.
+    private nonisolated(unsafe) var voiceCaptureActive = false
+    private nonisolated(unsafe) var focusFrameCounter = 0
+    /// The sharpest frame seen so far, as a deep copy: delegate buffers belong to the capture
+    /// pool, and holding on to them starves the pool and stalls frame delivery.
+    private nonisolated(unsafe) var bestVoiceFrame: (score: Float, buffer: CVPixelBuffer)?
 
     // MARK: - Logging
     private let logger = Logger(subsystem: "com.simonguest.QCamera", category: "QCAppDelegate")
@@ -182,6 +202,9 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
             // keep the most recent frame available for snapshot capture
             self.videoOutput = AVCaptureVideoDataOutput()
             self.videoOutput.alwaysDiscardsLateVideoFrames = true
+            self.videoOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+            ]
             self.videoOutput.setSampleBufferDelegate(self, queue: videoDataQueue)
             if self.captureSession.canAddOutput(self.videoOutput) {
                 self.captureSession.addOutput(self.videoOutput)
@@ -214,6 +237,20 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
     ) {
         // called on videoDataQueue, which owns latestFrame
         latestFrame = CMSampleBufferGetImageBuffer(sampleBuffer)
+
+        // While a voice-driven capture window is active, keep a copy of the sharpest frame.
+        if voiceCaptureActive, let pixelBuffer = latestFrame {
+            focusFrameCounter &+= 1
+            // score every 3rd frame: the Laplacian is cheap, but not free on the capture queue
+            if focusFrameCounter % 3 == 0 {
+                let score = QCFocusScore.score(of: pixelBuffer)
+                if score > (bestVoiceFrame?.score ?? -.infinity),
+                    let copy = Self.copyPixelBuffer(pixelBuffer)
+                {
+                    bestVoiceFrame = (score, copy)
+                }
+            }
+        }
     }
 
     // MARK: - Settings Management
@@ -523,6 +560,107 @@ final class QCAppDelegate: NSObject, NSApplicationDelegate, QCUsbWatcherDelegate
         sender.state = .on
 
         self.startCaptureWithVideoDevice(defaultDevice: deviceIndex)
+    }
+
+    // MARK: - Voice Capture Window
+
+    /// Starts a timed capture window: captureOutput scores frames for sharpness while it is
+    /// active, and the sharpest one is saved when it ends.
+    private func startVoiceCaptureWindow(duration: TimeInterval) {
+        let alreadyActive = videoDataQueue.sync { voiceCaptureActive }
+        guard !alreadyActive else {
+            logger.info("Capture window already active; ignoring voice trigger")
+            return
+        }
+        videoDataQueue.sync {
+            voiceCaptureActive = true
+            focusFrameCounter = 0
+            bestVoiceFrame = nil
+        }
+        voiceCaptureStartDate = Date.now
+        scheduleVoiceCaptureFinish(after: duration)
+    }
+
+    /// Adjusts the end of the active window when the listener hears the duration late
+    /// ("snap" then "snap five"), measured from when the window actually started.
+    private func rescheduleVoiceCaptureWindow(duration: TimeInterval) {
+        let active = videoDataQueue.sync { voiceCaptureActive }
+        guard active, let startDate = voiceCaptureStartDate else { return }
+        logger.info("Capture window rescheduled to \(duration, privacy: .public)s")
+        scheduleVoiceCaptureFinish(after: duration - Date.now.timeIntervalSince(startDate))
+    }
+
+    private func scheduleVoiceCaptureFinish(after seconds: TimeInterval) {
+        voiceCaptureFinishTask?.cancel()
+        voiceCaptureFinishTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(seconds, 0)))
+            guard !Task.isCancelled else { return }
+            await self?.finishVoiceCaptureWindow()
+        }
+    }
+
+    /// Ends the capture window and saves the sharpest frame it saw.
+    private func finishVoiceCaptureWindow() async {
+        voiceCaptureStartDate = nil
+        let best: (score: Float, buffer: CVPixelBuffer)? = videoDataQueue.sync {
+            voiceCaptureActive = false
+            defer { bestVoiceFrame = nil }
+            return bestVoiceFrame
+        }
+        guard let best else {
+            logger.info("Capture window finished with no frames to save")
+            return
+        }
+        logger.info("Capture window finished; saving frame with focus score \(best.score)")
+
+        let ciImage = CIImage(cvImageBuffer: best.buffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            logger.error("Could not convert the best frame to an image")
+            return
+        }
+        var folder: URL? = resolveSnapshotFolder()
+        if folder == nil {
+            folder = await promptForSnapshotFolder()
+        }
+        guard let folder else { return }
+        saveSnapshot(cgImage, in: folder)
+    }
+
+    /// Deep-copies a pixel buffer so it can outlive the capture pool's ownership.
+    private nonisolated static func copyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        var copyOut: CVPixelBuffer?
+        guard
+            CVPixelBufferCreate(
+                kCFAllocatorDefault, CVPixelBufferGetWidth(source),
+                CVPixelBufferGetHeight(source), CVPixelBufferGetPixelFormatType(source), nil,
+                &copyOut) == kCVReturnSuccess, let copy = copyOut
+        else { return nil }
+
+        // colorimetry attachments keep CIImage rendering the copy like the original
+        CVBufferPropagateAttachments(source, copy)
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(copy, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(copy, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+
+        // row-by-row: the copy's rowBytes can differ from the source's
+        for plane in 0..<max(CVPixelBufferGetPlaneCount(source), 1) {
+            guard let sourceBase = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                let copyBase = CVPixelBufferGetBaseAddressOfPlane(copy, plane)
+            else { return nil }
+            let sourceRowBytes = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+            let copyRowBytes = CVPixelBufferGetBytesPerRowOfPlane(copy, plane)
+            let rowBytes = min(sourceRowBytes, copyRowBytes)
+            for row in 0..<CVPixelBufferGetHeightOfPlane(source, plane) {
+                memcpy(
+                    copyBase.advanced(by: row * copyRowBytes),
+                    sourceBase.advanced(by: row * sourceRowBytes), rowBytes)
+            }
+        }
+        return copy
     }
 
     // MARK: - Application Lifecycle

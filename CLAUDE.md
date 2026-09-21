@@ -11,7 +11,7 @@ Quick Camera is a macOS utility application that displays output from USB-based 
 - Borderless mode with always-on-top
 - Aspect ratio locking
 - Capture snapshots as PNG, saved silently to a folder you choose once
-- Hands-free capture by saying "snap" (opt-in, on-device speech recognition)
+- Hands-free capture by saying "snap" (opt-in, on-device speech recognition); "snap 5" records a 1–5s window and saves the sharpest frame
 - Hot-plug camera detection (USB and Continuity Camera)
 - Persistent window position and settings
 
@@ -58,16 +58,20 @@ App target (`Quick Camera/`):
    - Time zone/locale/calendar are parameters so naming is testable
 
 6. **QCVoiceCommand.swift**
-   - Pure trigger-word matching and cooldown logic for the voice command
+   - Pure trigger-word matching, cooldown, spoken-duration parsing and refinement-window logic for the voice command
    - Deliberately free of audio/session state so it can be unit tested
 
 7. **QCVoiceListener.swift**
    - Listens to the microphone via its own `AVAudioEngine` and transcribes on-device with `SpeechAnalyzer`/`SpeechTranscriber`
-   - Reports trigger matches and failures through `QCVoiceListenerDelegate`
+   - Reports trigger matches (with an optional spoken duration), late duration refinements, and failures through `QCVoiceListenerDelegate`
+
+8. **QCFocusScore.swift**
+   - Focus/sharpness scoring for the voice capture window (mean absolute Laplacian of the downscaled luma plane, via Accelerate/vImage)
+   - Free of capture-session state so it can be unit tested with synthetic pixel buffers
 
 Test target (`Quick Camera Tests/`) — uses **Swift Testing**, not XCTest:
 
-- **QCRotationTests.swift**, **QCSnapshotFileTests.swift**, **QCSettingsManagerTests.swift**, **QCVoiceCommandTests.swift**
+- **QCRotationTests.swift**, **QCSnapshotFileTests.swift**, **QCSettingsManagerTests.swift**, **QCVoiceCommandTests.swift**, **QCVoiceAudioConverterTests.swift**, **QCFocusScoreTests.swift**
 
 ### Key Design Patterns
 
@@ -129,7 +133,10 @@ Test target (`Quick Camera Tests/`) — uses **Swift Testing**, not XCTest:
 - Matching lives in `QCVoiceCommand`: whole-word match only ("snapshot"/"snapped" don't fire) plus a 3s cooldown, because live transcription reports the same utterance several times (volatile refinements then the finalized text)
 - Requires the `com.apple.security.device.audio-input` entitlement and `NSMicrophoneUsageDescription`; mic permission is requested with `AVCaptureDevice.requestAccess(for: .audio)`. The new SpeechAnalyzer API does **not** need the old speech-recognition authorization
 - First enable downloads the transcription model via `AssetInventory` (needs network once; a no-op afterwards)
-- A recognized trigger calls the same `captureSnapshot()` as the menu item, so the white flash doubles as confirmation
+- A recognized trigger starts a timed **capture window** (default 3s; "snap 5"/"snap five" picks 1–5s, parsed in `QCVoiceCommand.parsedDurationSeconds`). While it is active, `captureOutput` scores every 3rd frame with `QCFocusScore` and keeps a **deep copy** of the sharpest one; the window's end saves it via the normal `saveSnapshot` path, so the white flash doubles as confirmation
+- **Never retain delegate sample/pixel buffers** — the capture pool is tiny and holding its buffers stalls frame delivery; that is why the best frame is deep-copied (`copyPixelBuffer`)
+- Volatile transcription hears "snap" before "snap five", so the listener fires immediately with the default and reports a late duration through `voiceListenerDidRefineDuration` (accepted within `QCVoiceCommand.refinementWindow`, 1.5s); the app delegate then reschedules the active window's end
+- The video data output is pinned to 420f (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`) so `QCFocusScore` can assume plane 0 is 8-bit luma
 
 ### Device Monitoring
 

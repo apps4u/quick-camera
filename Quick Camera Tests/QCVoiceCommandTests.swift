@@ -39,3 +39,63 @@ struct QCVoiceCommandTests {
         #expect(QCVoiceCommand.shouldFire(at: later, lastFired: first))
     }
 }
+
+@Suite("Voice command duration parsing")
+struct QCVoiceCommandParsingTests {
+
+    @Test("No number after snap yields nil duration", arguments: [
+        "snap",
+        "please snap now",
+        "ok, snap!",
+        "snap for a bit"
+    ])
+    func noDuration(transcript: String) {
+        #expect(QCVoiceCommand.parsedDurationSeconds(transcript) == nil)
+    }
+
+    @Test("Digits after snap are parsed and clamped to 1...5", arguments: [
+        ("snap 1", 1.0),
+        ("snap 3", 3.0),
+        ("snap 5", 5.0),
+        ("snap 0", 1.0), // clamped up
+        ("snap 10", 5.0) // clamped down
+    ])
+    func numericDuration(transcript: String, expected: TimeInterval) {
+        #expect(QCVoiceCommand.parsedDurationSeconds(transcript) == expected)
+    }
+
+    @Test("Spelled-out numbers one..five are parsed", arguments: [
+        ("snap one", 1.0),
+        ("snap two", 2.0),
+        ("snap three", 3.0),
+        ("snap four", 4.0),
+        ("snap five", 5.0)
+    ])
+    func wordDuration(transcript: String, expected: TimeInterval) {
+        #expect(QCVoiceCommand.parsedDurationSeconds(transcript) == expected)
+    }
+}
+
+@Suite("Voice command refinement window")
+struct QCVoiceCommandRefinementTests {
+
+    @Test("A match shortly after the trigger refines it")
+    func matchInsideWindowRefines() {
+        let fired = Date(timeIntervalSince1970: 100)
+        let refined = fired.addingTimeInterval(QCVoiceCommand.refinementWindow / 2)
+        #expect(QCVoiceCommand.isRefinement(at: refined, lastFired: fired))
+    }
+
+    @Test("A match past the refinement window does not refine")
+    func matchOutsideWindowDoesNotRefine() {
+        let fired = Date(timeIntervalSince1970: 100)
+        let late = fired.addingTimeInterval(QCVoiceCommand.refinementWindow + 0.1)
+        #expect(!QCVoiceCommand.isRefinement(at: late, lastFired: fired))
+    }
+
+    @Test("Nothing refines before any trigger has fired")
+    func noPriorTriggerDoesNotRefine() {
+        #expect(!QCVoiceCommand.isRefinement(at: Date(timeIntervalSince1970: 100), lastFired: nil))
+    }
+}
+

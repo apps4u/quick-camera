@@ -6,8 +6,11 @@ import os
 
 @MainActor
 protocol QCVoiceListenerDelegate: AnyObject {
-    /// The trigger word was heard.
-    func voiceListenerDidHearTrigger()
+    /// The trigger word was heard, with the spoken duration in seconds if one was heard.
+    func voiceListenerDidHearTrigger(durationSeconds: TimeInterval?)
+    /// A later transcription of the utterance that just fired included a duration
+    /// (e.g. "snap" was refined to "snap five").
+    func voiceListenerDidRefineDuration(durationSeconds: TimeInterval)
     /// Listening could not start or stopped working; `message` is user-facing.
     func voiceListener(failedWith message: String)
 }
@@ -140,12 +143,20 @@ final class QCVoiceListener {
                 let transcript = String(result.text.characters)
                 guard QCVoiceCommand.containsTrigger(transcript) else { continue }
                 let now = Date.now
-                guard QCVoiceCommand.shouldFire(at: now, lastFired: lastTriggerDate) else {
-                    continue
+                let duration = QCVoiceCommand.parsedDurationSeconds(transcript)
+                if QCVoiceCommand.shouldFire(at: now, lastFired: lastTriggerDate) {
+                    lastTriggerDate = now
+                    logger.info(
+                        "Voice trigger recognised (duration: \(String(describing: duration), privacy: .public))"
+                    )
+                    delegate?.voiceListenerDidHearTrigger(durationSeconds: duration)
+                } else if let duration,
+                    QCVoiceCommand.isRefinement(at: now, lastFired: lastTriggerDate)
+                {
+                    // volatile results hear "snap" before "snap five"; pass the late duration on
+                    logger.info("Voice trigger refined to \(duration, privacy: .public)s")
+                    delegate?.voiceListenerDidRefineDuration(durationSeconds: duration)
                 }
-                lastTriggerDate = now
-                logger.info("Voice trigger recognised")
-                delegate?.voiceListenerDidHearTrigger()
             }
         } catch is CancellationError {
             // stopped deliberately
@@ -196,3 +207,4 @@ final class QCVoiceAudioConverter: @unchecked Sendable {
         return status == .error ? nil : output
     }
 }
+
